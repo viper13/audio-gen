@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 ENGINE_DIR = ROOT_DIR / "engine"
 MODELS_DIR = ROOT_DIR / "models"
 DEFAULT_MODEL_DIR = MODELS_DIR / "mlx-Yue2-3B"
-DEFAULT_VAE_DIR = DEFAULT_MODEL_DIR / "vae"
+DEFAULT_VAE_DIR = MODELS_DIR / "vae"
 OUTPUTS_DIR = ROOT_DIR / "outputs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -27,8 +27,12 @@ REQUIRED_MODEL_FILES = (
     "ar-8bit.safetensors",
     "ar-bf16.safetensors",
     "nar-bf16.safetensors",
-    "vae/config.json",
-    "vae/model.safetensors",
+)
+
+# Required files inside models/vae (kept separate from mlx-Yue2-3B so lyra's strict manifest check passes)
+REQUIRED_VAE_FILES = (
+    "config.json",
+    "model.safetensors",
 )
 
 

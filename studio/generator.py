@@ -497,6 +497,13 @@ class GenerationManager:
                 with self._lock:
                     self._state.estimated_audio_seconds = round(len(semantic.tokens) / 25.0, 1)
 
+                # Free 8-bit AR & KV cache before loading BF16 conditioning + NAR (~7.3 GB) on 16 GB Macs
+                if params.precision != "bf16" and getattr(pipe, "_ar", None) is not None:
+                    pipe._ar = None
+                    gc.collect()
+                    mx.synchronize()
+                    mx.clear_cache()
+
                 noise = initial_noise(len(semantic.tokens), request.seed)
                 nar_start = time.perf_counter()
                 latents = pipe.synthesize(semantic, cancelled=cancelled_fn, noise=noise)
