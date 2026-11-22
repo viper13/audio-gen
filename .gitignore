@@ -1,0 +1,20 @@
+# Large AI model weights & Hugging Face caches
+models/
+
+# Generated songs & audio analysis artifacts
+outputs/
+analyses/
+investigation-sources/
+
+# Python / Virtual Environments
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# macOS & Editors
+.DS_Store
+*.log
+.vscode/
+.idea/
