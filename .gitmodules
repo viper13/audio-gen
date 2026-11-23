@@ -1,3 +1,6 @@
 [submodule "engine"]
 	path = engine
 	url = https://github.com/vanch007/mlx-Yue.git
+[submodule "albums"]
+	path = albums
+	url = git@github.com:viper13/music-albums.git
