@@ -1,10 +1,12 @@
 # Large AI model weights & Hugging Face caches
 models/
+.cache/
 
 # Generated songs & audio analysis artifacts
 outputs/
 analyses/
 investigation-sources/
+logs/
 
 # Python / Virtual Environments
 .venv/

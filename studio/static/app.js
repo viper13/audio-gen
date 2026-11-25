@@ -61,14 +61,42 @@
     const rt = sys.runtime || {};
     const mem = sys.memory || {};
     const an = sys.analysis || {};
+    const isTorch = (sys.backend || rt.backend) === "torch";
 
-    $("deviceLabel").textContent = rt.device_name || "Apple Silicon";
-    $("memoryLabel").textContent = `${mem.available_gib ?? "--"} / ${mem.total_gib ?? "--"} GB free`;
+    const brandTag = $("brandTag");
+    if (brandTag) {
+      brandTag.textContent = isTorch
+        ? (rt.cuda ? "CUDA · BF16" : "PyTorch · CPU")
+        : "MLX · 8-bit";
+    }
 
+    $("deviceLabel").textContent = rt.device_name || (isTorch ? "CUDA GPU" : "Apple Silicon");
+    if (isTorch && mem.vram_total_gib != null) {
+      $("memoryLabel").textContent = `${mem.vram_available_gib ?? "--"} / ${mem.vram_total_gib} GB VRAM`;
+      $("memoryPill").title = `GPU VRAM (${mem.available_gib ?? "--"} / ${mem.total_gib ?? "--"} GB System RAM free)`;
+    } else {
+      $("memoryLabel").textContent = `${mem.available_gib ?? "--"} / ${mem.total_gib ?? "--"} GB free`;
+    }
+
+    const gpuOk = Boolean(rt.supported || rt.metal || rt.cuda);
     const dot = $("metalDot");
-    dot.className = "dot " + (rt.metal ? (mem.low_memory_warning ? "dot-warn" : "dot-ok") : "dot-danger");
+    dot.className = "dot " + (gpuOk ? (mem.low_memory_warning ? "dot-warn" : "dot-ok") : "dot-danger");
     $("lowMemNotice").classList.toggle("hidden", !mem.low_memory_warning);
-    $("analysisDepWarning").classList.toggle("hidden", an.ready !== false);
+    if (isTorch) {
+      $("lowMemNotice").innerHTML =
+        "<strong>Low available GPU VRAM detected:</strong> Close other GPU-heavy apps before generating to keep headroom for the YuE2-3B CUDA pipeline.";
+      const prec = $("precisionSelect");
+      if (prec && !prec.dataset.torchConfigured) {
+        prec.dataset.torchConfigured = "1";
+        prec.innerHTML = `<option value="bf16" selected>BF16 Full Precision (CUDA · AR Offload)</option>`;
+      }
+    }
+
+    const warn = $("analysisDepWarning");
+    warn.classList.toggle("hidden", an.ready !== false);
+    if (an.reason) {
+      warn.innerHTML = `<strong>Unavailable on this backend:</strong> ${an.reason}`;
+    }
     syncAnalyzeButton();
   }
 
@@ -77,6 +105,17 @@
     const ready = Boolean(models.ready);
     const dl = models.download || {};
     const isDownloading = dl.status === "downloading";
+    const expectedGb = models.expected_size_gib ?? 10.6;
+    const isTorch = models.backend === "torch";
+
+    if ($("setupCardTitle")) {
+      $("setupCardTitle").textContent = isTorch ? "Download YuE2-3B CUDA Weights" : "Download YuE2-3B MLX Weights";
+    }
+    if ($("setupCardDesc")) {
+      $("setupCardDesc").innerHTML = isTorch
+        ? `Official PyTorch weights (<code>${models.repo_id || "m-a-p/YuE2-3B + m-a-p/YuE2-Vae"}</code>, ~${expectedGb} GB): BF16 YuE2-3B AR+NAR and 48kHz Oobleck VAE.`
+        : `Pre-converted Apple Silicon weights (<code>${models.repo_id || "vanch007/mlx-Yue2-3B"}</code>, ~${expectedGb} GB): 8-bit AR, BF16 acoustic NAR, and 48kHz Oobleck VAE.`;
+    }
 
     const dot = $("modelDot");
     const label = $("modelLabel");
@@ -106,7 +145,7 @@
       topBtn.classList.remove("hidden");
       setupCard.classList.remove("hidden");
       $("downloadModelBtn").disabled = false;
-      $("downloadModelBtn").textContent = "Download Weights (~10.6 GB)";
+      $("downloadModelBtn").textContent = `Download Weights (~${expectedGb} GB)`;
       if (dl.status === "failed" && dl.error) {
         $("downloadErrorText").textContent = dl.error;
         $("downloadErrorText").classList.remove("hidden");
@@ -121,7 +160,7 @@
     try {
       const snap = await api("/api/models/download", { method: "POST" });
       renderModels(snap);
-      toast("Started downloading YuE2-3B MLX weights from Hugging Face.", "ok");
+      toast("Started downloading YuE2-3B weights from Hugging Face.", "ok");
     } catch (err) {
       toast(err.message, "error");
     }

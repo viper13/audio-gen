@@ -16,10 +16,9 @@ import uuid
 
 os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
-from .config import MODELS_DIR, ROOT_DIR, compute_safe_memory_budget_gib
+from .config import BACKEND, HF_CACHE_DIR, MODELS_DIR, ROOT_DIR, compute_safe_memory_budget_gib
 
 ANALYSES_DIR = ROOT_DIR / "analyses"
-HF_CACHE_DIR = MODELS_DIR / "hf-cache"
 ALLOWED_AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".aiff", ".webm"}
 
 
@@ -91,13 +90,21 @@ def _extract_abc_header_info(abc_text: str | None) -> dict:
 def check_analysis_dependencies() -> dict:
     ffmpeg_path = shutil.which("ffmpeg")
     missing_py = []
-    for mod in ("mido", "pretty_midi", "scipy"):
+    for mod in ("mido", "pretty_midi", "scipy", "mir_eval"):
         try:
             __import__(mod)
         except ImportError:
             missing_py.append(mod)
+    reason = None
+    if not ffmpeg_path:
+        reason = "FFmpeg was not found in PATH."
+    elif missing_py:
+        reason = f"Missing Python packages for audio analysis: {', '.join(missing_py)}."
     return {
         "ready": bool(ffmpeg_path) and len(missing_py) == 0,
+        "supported": True,
+        "backend": BACKEND,
+        "reason": reason,
         "ffmpeg": ffmpeg_path,
         "missing_python": missing_py,
     }
@@ -319,6 +326,7 @@ class AnalysisManager:
             clean_title = (title or Path(original_filename).stem or "Audio Track").strip()
             analysis_id = f"{ts}-{_slugify(clean_title)}-{short}"
 
+            backend_label = "PyTorch CUDA" if BACKEND == "torch" else "MLX"
             self._cancel_event = threading.Event()
             self._state = AnalysisJobState(
                 job_id=uuid.uuid4().hex[:12],
@@ -326,7 +334,7 @@ class AnalysisManager:
                 title=clean_title,
                 status="running",
                 stage="loading",
-                stage_label="Loading SheetSage2 + MERT-v2-FullSong MLX models (downloads on first run)...",
+                stage_label=f"Loading SheetSage2 + MERT-v2-FullSong ({backend_label}, downloads on first run)...",
                 percent=5.0,
                 started_at=time.time(),
             )
@@ -353,14 +361,9 @@ class AnalysisManager:
     ) -> None:
         dest = self.analyses_dir / analysis_id
         try:
-            import mlx.core as mx
-            from lyra.measure import GPUExecution
-            from lyra.transcription.pipeline import transcribe
-            from .memory_guard import install_16gb_friendly_guard
-
-            install_16gb_friendly_guard()
             self.analyses_dir.mkdir(parents=True, exist_ok=True)
             HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            (HF_CACHE_DIR / "hub").mkdir(parents=True, exist_ok=True)
             budget = compute_safe_memory_budget_gib()
 
             def on_progress(evt: dict) -> None:
@@ -392,22 +395,42 @@ class AnalysisManager:
                     snap = self._state.to_dict()
                 self._emit("analysis_job", snap)
 
-            with GPUExecution(backend="mlx", memory_budget_gib=budget) as guard:
-                def cancelled() -> bool:
-                    guard.check()
-                    return self._cancel_event.is_set()
+            if BACKEND == "torch":
+                from .torch_transcription import transcribe as torch_transcribe
 
-                transcribe(
+                torch_transcribe(
                     temp_source,
                     dest,
                     offline=False,
-                    cache_dir=str(HF_CACHE_DIR),
+                    cache_dir=str(HF_CACHE_DIR / "hub"),
+                    device="auto",
                     task=task,
                     max_seconds=max_seconds,
-                    cancelled=cancelled,
+                    cancelled=self._cancel_event.is_set,
                     progress=on_progress,
                 )
-                guard.check()
+            else:
+                from lyra.measure import GPUExecution
+                from lyra.transcription.pipeline import transcribe
+                from .memory_guard import install_16gb_friendly_guard
+
+                install_16gb_friendly_guard()
+                with GPUExecution(backend="mlx", memory_budget_gib=budget) as guard:
+                    def cancelled() -> bool:
+                        guard.check()
+                        return self._cancel_event.is_set()
+
+                    transcribe(
+                        temp_source,
+                        dest,
+                        offline=False,
+                        cache_dir=str(HF_CACHE_DIR / "hub"),
+                        task=task,
+                        max_seconds=max_seconds,
+                        cancelled=cancelled,
+                        progress=on_progress,
+                    )
+                    guard.check()
 
             # Preserve the uploaded source audio inside the analysis directory for playback
             ext = Path(original_filename).suffix.lower() or ".audio"
@@ -468,8 +491,16 @@ class AnalysisManager:
             except Exception:
                 pass
             gc.collect()
-            try:
-                import mlx.core as mx
-                mx.clear_cache()
-            except Exception:
-                pass
+            if BACKEND == "torch":
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            else:
+                try:
+                    import mlx.core as mx
+                    mx.clear_cache()
+                except Exception:
+                    pass

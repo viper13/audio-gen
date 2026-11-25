@@ -19,6 +19,7 @@ import uuid
 os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
 from .config import (
+    BACKEND,
     DEFAULT_MODEL_DIR,
     DEFAULT_VAE_DIR,
     OUTPUTS_DIR,
@@ -151,6 +152,90 @@ def _make_studio_pipeline(on_stage_event: Callable[[dict], None]):
                 proxy._push(force=True, status="completed")
 
     return StudioYuE2Pipeline
+
+
+_CUDA_GRAPH_PATCHED = False
+
+
+def _ensure_cuda_graph_attention_backend() -> None:
+    """On Windows PyTorch builds without compiled FlashAttention, route GraphAR 'auto' to cuDNN/SDPA."""
+    global _CUDA_GRAPH_PATCHED
+    if _CUDA_GRAPH_PATCHED:
+        return
+    import torch
+    import torch.nn.functional as F
+    from yue2 import cuda_graph
+
+    if not torch.cuda.is_available():
+        _CUDA_GRAPH_PATCHED = True
+        return
+
+    flash_ok = False
+    if hasattr(torch.ops.aten, "_flash_attention_forward"):
+        try:
+            q = torch.zeros((1, 16, 128), device="cuda", dtype=torch.bfloat16)
+            k = torch.zeros((8, 8, 128), device="cuda", dtype=torch.bfloat16)
+            v = torch.zeros((8, 8, 128), device="cuda", dtype=torch.bfloat16)
+            cu_q = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+            cu_k = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+            used = torch.tensor([4], dtype=torch.int32, device="cuda")
+            torch.ops.aten._flash_attention_forward(q, k, v, cu_q, cu_k, 1, 8, 0.0, False, False, seqused_k=used)
+            torch.cuda.synchronize()
+            flash_ok = True
+        except Exception:
+            flash_ok = False
+
+    if not flash_ok:
+        fallback = "sdpa"
+        if torch.backends.cudnn.is_available():
+            try:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                q = torch.zeros((1, 16, 1, 128), device="cuda", dtype=torch.bfloat16)
+                k = torch.zeros((1, 8, 8, 128), device="cuda", dtype=torch.bfloat16)
+                v = torch.zeros((1, 8, 8, 128), device="cuda", dtype=torch.bfloat16)
+                mask = torch.ones((1, 1, 1, 8), device="cuda", dtype=torch.bool)
+                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                    F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False, enable_gqa=True)
+                torch.cuda.synchronize()
+                fallback = "cudnn"
+            except Exception:
+                fallback = "sdpa"
+
+        orig_init = cuda_graph.GraphAR.__init__
+
+        def _patched_init(self, model, prefixes, max_tokens, *, capture=True, attention_backend="auto", fuse_projections=False):
+            if attention_backend == "auto":
+                attention_backend = fallback
+            return orig_init(
+                self,
+                model,
+                prefixes,
+                max_tokens,
+                capture=capture,
+                attention_backend=attention_backend,
+                fuse_projections=fuse_projections,
+            )
+
+        cuda_graph.GraphAR.__init__ = _patched_init
+
+    _CUDA_GRAPH_PATCHED = True
+
+
+def _make_torch_studio_pipeline(on_stage_event: Callable[[dict], None]):
+    """Dynamically subclass upstream PyTorch/CUDA YuE2Pipeline for progress streaming."""
+    _ensure_cuda_graph_attention_backend()
+    from yue2.pipeline import YuE2Pipeline
+
+    class TorchStudioYuE2Pipeline(YuE2Pipeline):
+        @contextmanager
+        def _status(self, label, *, total=None, unit=None):
+            with super()._status(label, total=total, unit=unit) as inner:
+                proxy = _ProgressStageProxy(inner, label, unit, total, on_stage_event)
+                yield proxy
+                proxy._push(force=True, status="completed")
+
+    return TorchStudioYuE2Pipeline
 
 
 def _read_song_entry(song_dir: Path) -> dict | None:
@@ -336,7 +421,7 @@ class GenerationManager:
         model_info = inspect_models(self.model_dir, self.vae_dir)
         if not model_info["ready"]:
             raise RuntimeError(
-                "YuE2-3B MLX weights are not downloaded yet. Click 'Download Model' first."
+                "YuE2-3B weights are not downloaded yet. Click 'Download Weights' first."
             )
 
         with self._lock:
@@ -350,13 +435,18 @@ class GenerationManager:
             params.seed = seed
 
             self._cancel_event = threading.Event()
+            init_label = (
+                "Initializing PyTorch CUDA pipeline..."
+                if BACKEND == "torch"
+                else "Initializing Apple Silicon MLX pipeline..."
+            )
             self._state = JobState(
                 job_id=uuid.uuid4().hex[:12],
                 song_id=song_id,
                 title=params.title.strip() or "Untitled Track",
                 status="running",
                 stage="loading",
-                stage_label="Initializing Apple Silicon MLX pipeline...",
+                stage_label=init_label,
                 overall_percent=2.0,
                 started_at=time.time(),
                 params={
@@ -425,14 +515,10 @@ class GenerationManager:
 
     def _run_job(self, params: GenerateParams, song_id: str) -> None:
         destination = self.outputs_dir / song_id
+        effective_precision = params.precision
         try:
-            import mlx.core as mx
-            from lyra.pipeline import SongResult, initial_noise
             from yue2.protocol import GenerationConfig, Sampling
             from yue2.storage import identity
-            from .memory_guard import install_16gb_friendly_guard
-
-            install_16gb_friendly_guard()
 
             style = params.style.strip()
             lyrics = params.lyrics.strip()
@@ -456,8 +542,6 @@ class GenerationManager:
                 ode_steps=int(params.ode_steps),
             )
 
-            StudioPipe = _make_studio_pipeline(lambda info: self._handle_stage_update(info, params))
-
             request_kwargs: dict[str, Any] = {
                 "style": style,
                 "lyrics": lyrics,
@@ -472,74 +556,157 @@ class GenerationManager:
 
             cancelled_fn = self._cancel_event.is_set
 
-            with StudioPipe.from_pretrained(
-                str(self.model_dir),
-                vae=str(self.vae_dir),
-                precision=params.precision,
-                local_files_only=True,
-                memory_budget_gib=budget,
-                vae_core_frames=256,
-                progress=True,
-                generation_config=gen_config,
-                require_ac=False,
-            ) as pipe:
-                request = pipe._request(**request_kwargs)
-                effective_cfg = pipe.effective_config(request)
-                request_id = identity(
-                    {"request": request.to_dict(), "config": effective_cfg, "weights": pipe.weights}
+            if BACKEND == "torch":
+                import torch
+                from yue2.pipeline import SongResult
+
+                torch_backend = os.environ.get("STUDIO_TORCH_BACKEND", "torch")
+                can_fp8 = (
+                    torch.cuda.is_available()
+                    and torch.cuda.get_device_capability(0) >= (8, 9)
+                )
+                torch_quant = "fp8" if (params.precision == "fp8" and can_fp8) else "none"
+                effective_precision = "fp8" if torch_quant == "fp8" else "bf16"
+                offload_ar = budget <= 16.0
+                vae_core_frames = 256 if budget <= 12.5 else 512
+
+                StudioPipe = _make_torch_studio_pipeline(
+                    lambda info: self._handle_stage_update(info, params)
+                )
+                with StudioPipe.from_pretrained(
+                    str(self.model_dir),
+                    vae=str(self.vae_dir),
+                    device="auto",
+                    memory_budget_gib=budget,
+                    backend=torch_backend,
+                    quantization=torch_quant,
+                    offload_ar=offload_ar,
+                    local_files_only=True,
+                    generation_config=gen_config,
+                    vae_core_frames=vae_core_frames,
+                    progress=True,
+                ) as pipe:
+                    request = pipe._request(**request_kwargs)
+                    effective_cfg = pipe.effective_config(request)
+                    request_id = identity(
+                        {"request": request.to_dict(), "config": effective_cfg, "weights": pipe.weights}
+                    )
+
+                    t0 = time.perf_counter()
+                    plan = pipe.plan(request=request, cancelled=cancelled_fn)
+                    semantic = pipe.generate_semantic(plan, cancelled=cancelled_fn)
+
+                    with self._lock:
+                        self._state.estimated_audio_seconds = round(len(semantic.tokens) / 25.0, 1)
+
+                    nar_start = time.perf_counter()
+                    latents = pipe.synthesize(semantic, cancelled=cancelled_fn)
+                    nar_seconds = time.perf_counter() - nar_start
+
+                    if cancelled_fn():
+                        raise InterruptedError("Generation cancelled by user")
+
+                    vae_start = time.perf_counter()
+                    audio = pipe.decode(latents)
+                    vae_seconds = time.perf_counter() - vae_start
+
+                    timing = {
+                        "abc": plan.timing,
+                        "semantic": semantic.timing,
+                        "nar_seconds": nar_seconds,
+                        "vae_seconds": vae_seconds,
+                        "load": dict(pipe.load_timing),
+                        "e2e_seconds": time.perf_counter() - t0,
+                    }
+                    result = SongResult(
+                        audio,
+                        48000,
+                        semantic,
+                        latents,
+                        effective_cfg,
+                        pipe.weights,
+                        timing,
+                        request_id,
+                    )
+            else:
+                import mlx.core as mx
+                from lyra.pipeline import SongResult, initial_noise
+                from .memory_guard import install_16gb_friendly_guard
+
+                install_16gb_friendly_guard()
+
+                StudioPipe = _make_studio_pipeline(
+                    lambda info: self._handle_stage_update(info, params)
                 )
 
-                t0 = time.perf_counter()
-                plan = pipe.plan(request=request, cancelled=cancelled_fn)
-                semantic = pipe.generate_semantic(plan, cancelled=cancelled_fn)
+                with StudioPipe.from_pretrained(
+                    str(self.model_dir),
+                    vae=str(self.vae_dir),
+                    precision=params.precision,
+                    local_files_only=True,
+                    memory_budget_gib=budget,
+                    vae_core_frames=256,
+                    progress=True,
+                    generation_config=gen_config,
+                    require_ac=False,
+                ) as pipe:
+                    request = pipe._request(**request_kwargs)
+                    effective_cfg = pipe.effective_config(request)
+                    request_id = identity(
+                        {"request": request.to_dict(), "config": effective_cfg, "weights": pipe.weights}
+                    )
 
-                # Update estimated final length once semantic tokens are complete
-                with self._lock:
-                    self._state.estimated_audio_seconds = round(len(semantic.tokens) / 25.0, 1)
+                    t0 = time.perf_counter()
+                    plan = pipe.plan(request=request, cancelled=cancelled_fn)
+                    semantic = pipe.generate_semantic(plan, cancelled=cancelled_fn)
 
-                # Free 8-bit AR & KV cache before loading BF16 conditioning + NAR (~7.3 GB) on 16 GB Macs
-                if params.precision != "bf16" and getattr(pipe, "_ar", None) is not None:
-                    pipe._ar = None
+                    # Update estimated final length once semantic tokens are complete
+                    with self._lock:
+                        self._state.estimated_audio_seconds = round(len(semantic.tokens) / 25.0, 1)
+
+                    # Free 8-bit AR & KV cache before loading BF16 conditioning + NAR (~7.3 GB) on 16 GB Macs
+                    if params.precision != "bf16" and getattr(pipe, "_ar", None) is not None:
+                        pipe._ar = None
+                        gc.collect()
+                        mx.synchronize()
+                        mx.clear_cache()
+
+                    noise = initial_noise(len(semantic.tokens), request.seed)
+                    nar_start = time.perf_counter()
+                    latents = pipe.synthesize(semantic, cancelled=cancelled_fn, noise=noise)
+                    nar_seconds = time.perf_counter() - nar_start
+
+                    if cancelled_fn():
+                        raise InterruptedError("Generation cancelled by user")
+
+                    # Critical optimization for 16 GB Apple M1: release AR + NAR (~7.3 GB) before loading 48kHz FP32 VAE!
+                    pipe._release_models()
                     gc.collect()
-                    mx.synchronize()
                     mx.clear_cache()
 
-                noise = initial_noise(len(semantic.tokens), request.seed)
-                nar_start = time.perf_counter()
-                latents = pipe.synthesize(semantic, cancelled=cancelled_fn, noise=noise)
-                nar_seconds = time.perf_counter() - nar_start
+                    vae_start = time.perf_counter()
+                    audio = pipe.decode(latents, cancelled=cancelled_fn)
+                    vae_seconds = time.perf_counter() - vae_start
 
-                if cancelled_fn():
-                    raise InterruptedError("Generation cancelled by user")
-
-                # Critical optimization for 16 GB Apple M1: release AR + NAR (~7.3 GB) before loading 48kHz FP32 VAE!
-                pipe._release_models()
-                gc.collect()
-                mx.clear_cache()
-
-                vae_start = time.perf_counter()
-                audio = pipe.decode(latents, cancelled=cancelled_fn)
-                vae_seconds = time.perf_counter() - vae_start
-
-                timing = {
-                    "abc": plan.timing,
-                    "semantic": semantic.timing,
-                    "nar_seconds": nar_seconds,
-                    "vae_seconds": vae_seconds,
-                    "load": dict(pipe.load_timing),
-                    "e2e_seconds": time.perf_counter() - t0,
-                }
-                result = SongResult(
-                    audio,
-                    48000,
-                    semantic,
-                    latents,
-                    effective_cfg,
-                    pipe.weights,
-                    timing,
-                    request_id,
-                    noise,
-                )
+                    timing = {
+                        "abc": plan.timing,
+                        "semantic": semantic.timing,
+                        "nar_seconds": nar_seconds,
+                        "vae_seconds": vae_seconds,
+                        "load": dict(pipe.load_timing),
+                        "e2e_seconds": time.perf_counter() - t0,
+                    }
+                    result = SongResult(
+                        audio,
+                        48000,
+                        semantic,
+                        latents,
+                        effective_cfg,
+                        pipe.weights,
+                        timing,
+                        request_id,
+                        noise,
+                    )
 
             # Save artifacts outside GPUExecution context so disk I/O never fights the memory guard
             with self._lock:
@@ -554,7 +721,7 @@ class GenerationManager:
             studio_meta = {
                 "title": params.title.strip() or "Untitled Track",
                 "instrumental": bool(params.instrumental),
-                "precision": params.precision,
+                "precision": effective_precision,
                 "ode_steps": int(params.ode_steps),
                 "max_tokens": int(params.max_tokens),
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -591,11 +758,17 @@ class GenerationManager:
             if destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
             msg = str(exc)
-            if isinstance(exc, MemoryError) or "memory" in msg.lower() or "swapping" in msg.lower():
-                msg = (
-                    f"{msg}. Tip for 16 GB Apple M1: close heavy browser tabs/apps, "
-                    "use 8-bit precision, 8 ODE steps, and shorter max tokens (600–1200)."
-                )
+            if isinstance(exc, MemoryError) or "memory" in msg.lower() or "swapping" in msg.lower() or "out of memory" in msg.lower():
+                if BACKEND == "torch":
+                    msg = (
+                        f"{msg}. Tip for 12 GB NVIDIA GPU: close other GPU-heavy apps/browsers, "
+                        "use 8 ODE steps, and shorter max tokens (600–1200)."
+                    )
+                else:
+                    msg = (
+                        f"{msg}. Tip for 16 GB Apple M1: close heavy browser tabs/apps, "
+                        "use 8-bit precision, 8 ODE steps, and shorter max tokens (600–1200)."
+                    )
             with self._lock:
                 self._state.status = "failed"
                 self._state.stage = "idle"
@@ -607,8 +780,16 @@ class GenerationManager:
 
         finally:
             gc.collect()
-            try:
-                import mlx.core as mx
-                mx.clear_cache()
-            except Exception:
-                pass
+            if BACKEND == "torch":
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            else:
+                try:
+                    import mlx.core as mx
+                    mx.clear_cache()
+                except Exception:
+                    pass

@@ -25,7 +25,7 @@ from .analyzer import (
     get_analysis_detail,
     list_analyses,
 )
-from .config import DEFAULT_MODEL_DIR, DEFAULT_VAE_DIR, OUTPUTS_DIR, STATIC_DIR, get_system_status
+from .config import DEFAULT_MODEL_DIR, DEFAULT_VAE_DIR, OUTPUTS_DIR, STATIC_DIR, TMP_DIR, get_system_status
 from .generator import (
     GenerateParams,
     GenerationManager,
@@ -75,7 +75,7 @@ class GenerateRequest(BaseModel):
     style: str = Field(..., min_length=2, max_length=2000)
     lyrics: str = Field(default="", max_length=12000)
     cot: Literal["full", "melody", "off"] = "melody"
-    precision: Literal["8bit", "bf16", "4bit"] = "8bit"
+    precision: Literal["8bit", "bf16", "4bit", "fp8"] = "8bit"
     ode_steps: int = Field(default=8, ge=1, le=64)
     max_tokens: int = Field(default=1200, ge=200, le=9000)
     min_tokens: int = Field(default=200, ge=0, le=9000)
@@ -92,6 +92,7 @@ class GenerateRequest(BaseModel):
 broker = EventBroker()
 model_manager = ModelDownloadManager(
     model_dir=DEFAULT_MODEL_DIR,
+    vae_dir=DEFAULT_VAE_DIR,
     on_change=lambda snap: broker.publish("models", snap),
 )
 gen_manager = GenerationManager(
@@ -156,7 +157,7 @@ async def api_generate(req: GenerateRequest) -> dict:
     if analysis_manager.is_running():
         raise HTTPException(
             status_code=409,
-            detail="An audio analysis job is currently using the Apple Silicon GPU. Wait for it to finish or cancel it first.",
+            detail="An audio analysis job is currently using the GPU. Wait for it to finish or cancel it first.",
         )
     if not req.instrumental and not req.lyrics.strip():
         raise HTTPException(
@@ -250,7 +251,7 @@ async def api_analysis_upload(
     if gen_manager.is_running():
         raise HTTPException(
             status_code=409,
-            detail="A song generation job is currently using the Apple Silicon GPU. Wait for it to finish or cancel it first.",
+            detail="A song generation job is currently using the GPU. Wait for it to finish or cancel it first.",
         )
     if task not in {"full", "melody-full", "melody-vocal"}:
         raise HTTPException(status_code=400, detail="Invalid analysis task")
@@ -272,7 +273,8 @@ async def api_analysis_upload(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="max_seconds must be a positive number") from exc
 
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix="yue2-upload-", suffix=ext)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix="yue2-upload-", suffix=ext, dir=str(TMP_DIR))
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(tmp_fd, "wb") as out:

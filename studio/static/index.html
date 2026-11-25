@@ -20,7 +20,7 @@
           </svg>
         </div>
         <div>
-          <div class="brand-title">YuE2 Studio <span class="brand-tag">MLX · 8-bit</span></div>
+          <div class="brand-title">YuE2 Studio <span id="brandTag" class="brand-tag">MLX · 8-bit</span></div>
           <div class="brand-sub">HKUST / M-A-P Full-Song Generator &amp; Music Analyzer</div>
         </div>
       </div>
@@ -206,8 +206,8 @@
         <div id="modelSetupCard" class="panel setup-card hidden">
           <div class="setup-header">
             <div>
-              <h2>Download YuE2-3B MLX Weights</h2>
-              <p class="muted">Pre-converted Apple Silicon weights (<code>vanch007/mlx-Yue2-3B</code>, ~10.6 GB): 8-bit AR, BF16 acoustic NAR, and 48kHz Oobleck VAE.</p>
+              <h2 id="setupCardTitle">Download YuE2-3B Weights</h2>
+              <p id="setupCardDesc" class="muted">Pre-converted Apple Silicon weights (<code>vanch007/mlx-Yue2-3B</code>, ~10.6 GB): 8-bit AR, BF16 acoustic NAR, and 48kHz Oobleck VAE.</p>
             </div>
             <button id="downloadModelBtn" class="btn-primary btn-compact" type="button">Download Weights</button>
           </div>
@@ -290,7 +290,7 @@
         <div class="panel-header">
           <div>
             <h1>Analyze Any Music Track</h1>
-            <p class="muted">Extract BPM, musical key, chords, song structure, vocal/instrumental melody, MIDI &amp; ABC score locally with SheetSage2 + MERT-v2 (MLX).</p>
+            <p class="muted">Extract BPM, musical key, chords, song structure, vocal/instrumental melody, MIDI &amp; ABC score locally with SheetSage2 + MERT-v2.</p>
           </div>
         </div>
 
@@ -331,7 +331,7 @@
             </div>
           </div>
 
-          <p class="hint">First analysis automatically downloads SheetSage2 &amp; MERT-v2-FullSong MLX weights from Hugging Face into <code>models/hf-cache</code>.</p>
+          <p class="hint">First analysis automatically downloads SheetSage2 &amp; MERT-v2-FullSong weights from Hugging Face into <code>models/hf-cache</code>.</p>
 
           <button id="analyzeBtn" type="submit" class="btn-primary" disabled>
             <span aria-hidden="true">🎛</span>
